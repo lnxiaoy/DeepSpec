@@ -1,6 +1,8 @@
 import os
 import json
 import sqlite3
+import urllib3
+import requests
 import time
 import google.generativeai as genai
 from docx import Document
@@ -9,20 +11,37 @@ from colorama import init, Fore
 from google.api_core import retry
 
 init(autoreset=True)
+# ==========================================
+# 🛑 核心修复区：全局禁用 SSL 验证
+# ==========================================
+# 1. 禁用警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# 2. 暴力打补丁：强制所有 requests 请求都不验证证书
+# 这是解决 SSLCertVerificationError 的终极方案
+old_merge_environment_settings = requests.Session.merge_environment_settings
+
+def merge_environment_settings(self, url, proxies, stream, verify, cert):
+    # 无论原来要求什么，这里强制把 verify 设为 False
+    return old_merge_environment_settings(self, url, proxies, stream, False, cert)
+
+requests.Session.merge_environment_settings = merge_environment_settings
+# ==========================================
+
 
 # --- 配置区域 ---
 # 替换为你自己的 Google AI Studio API Key
-API_KEY = "YOUR_GOOGLE_API_KEY_HERE"
+API_KEY = ""
 
 # 使用 Flash 模型，速度最快，且免费额度高
-MODEL_NAME = "gemini-1.5-flash" 
+MODEL_NAME = "gemini-2.5-flash" 
 
-DOC_FOLDER = "./tdocs/RAN1_123" # 指向你下载好的文件夹
+DOC_FOLDER = "E:/000_3GPP_Download/tdocs/RAN1_123" # 指向你下载好的文件夹
 DB_NAME = "ran1_knowledge_cloud.db" # 新数据库名
-MAX_WORKERS = 5 # Google 免费层级限制并发，建议 2-5 之间
+MAX_WORKERS = 1 # Google 免费层级限制并发，建议 2-5 之间
 
 # 配置 API
-genai.configure(api_key=API_KEY)
+genai.configure(api_key=API_KEY, transport="rest")
 
 # --- 数据库初始化 (一对多结构) ---
 def init_db():
@@ -60,6 +79,10 @@ def read_docx(file_path):
 # --- 云端分析核心函数 ---
 @retry.Retry() # 自动重试机制，应对网络波动
 def analyze_with_gemini(text, filename):
+    print(f"{Fore.CYAN}[{filename}] 正在连接 Google API...", end="\r") # 增加调试打印
+    
+    # --- 核心修改 2: 强制使用 REST 协议 ---
+    # 这能解决 99% 的“卡住”问题
     model = genai.GenerativeModel(MODEL_NAME)
     
     # 强制让模型输出 JSON 数组
@@ -91,6 +114,7 @@ def analyze_with_gemini(text, filename):
             prompt,
             generation_config={"response_mime_type": "application/json"}
         )
+        print(f"{Fore.BLUE}[{filename}] API 响应成功！      ") # 空格是为了覆盖之前的打印
         return response.text
     except Exception as e:
         print(f"{Fore.RED}API Error ({filename}): {e}")
@@ -125,9 +149,8 @@ def worker(file_path, filename):
     content = read_docx(file_path)
     if not content: return None
 
-    # 2. 调用 API
-    # 免费版 API 限制每分钟请求数 (RPM)，加一点延迟防止 429 错误
-    time.sleep(2) 
+    print(f"{Fore.YELLOW}[{filename}] 冷却中 (等待API配额)...")
+    time.sleep(5)
     json_result = analyze_with_gemini(content, filename)
     
     if json_result:
@@ -141,16 +164,21 @@ def main():
     conn = init_db()
     cursor = conn.cursor()
     
-    files = [f for f in os.listdir(DOC_FOLDER) if f.endswith(".docx")]
-    # 过滤掉已经分析过的文件（为了演示，这里先简单全量跑，实际建议做去重）
+    # 获取所有 .docx 文件
+    all_files = [f for f in os.listdir(DOC_FOLDER) if f.endswith(".docx")]
+    
+    # --- 修改点：只取前 10 个文件进行测试 ---
+    # 如果文件少于 10 个，它会自动取全部，不会报错
+    files_to_process = all_files[:10] 
     
     print(f"{Fore.GREEN}=== 启动云端分析引擎 (Gemini Flash) ===")
-    print(f"目标文件数: {len(files)} | 并发线程: {MAX_WORKERS}")
+    print(f"模式: 快速验证 (测试前 10 篇)") # 提示一下当前是测试模式
+    print(f"目标文件数: {len(files_to_process)} | 并发线程: {MAX_WORKERS}")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_file = {
             executor.submit(worker, os.path.join(DOC_FOLDER, f), f): f 
-            for f in files
+            for f in files_to_process
         }
         
         success_count = 0
