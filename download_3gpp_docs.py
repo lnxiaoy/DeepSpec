@@ -1,165 +1,153 @@
-import requests
-from bs4 import BeautifulSoup
 import os
+import requests
 import zipfile
-from urllib.parse import urljoin, urlparse
-import concurrent.futures
-import threading
-import shutil # 新增导入，用于可能创建的临时目录
-import sys
-import io 
+import shutil
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import time
+import urllib3 # 新增
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-# 抑制 InsecureRequestWarning (如果需要)
-import urllib3
+# --- 核心修改：禁用 SSL 警告 ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 定义 User-Agent 头部，模拟浏览器
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-}
+# --- 配置区域 ---
 
-# 用于保护打印输出，防止多线程同时打印造成混乱
-print_lock = threading.Lock()
+# 这里填你要下载的会议 URL
+TARGET_URL = "https://www.3gpp.org/ftp/tsg_ran/WG1_RL1/TSGR1_123/Docs"
 
-def download_and_extract_single_zip(file_info, download_dir, verify_ssl=False):
+# 本地保存路径
+SAVE_DIR = "./tdocs/RAN1_123"
+
+# 并发线程数
+MAX_WORKERS = 8
+
+# ----------------
+
+def get_zip_links(url):
+    """解析页面，获取所有 zip 文件的链接"""
+    print(f"正在分析页面: {url} ...")
+    try:
+        # --- 修改点 1: 增加 verify=False ---
+        response = requests.get(url, timeout=30, verify=False)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        links = []
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href']
+            if href.lower().endswith('.zip'):
+                full_url = urljoin(url, href)
+                links.append(full_url)
+        
+        print(f"✅ 找到 {len(links)} 个文档。")
+        return links
+    except Exception as e:
+        print(f"❌ 获取页面失败: {e}")
+        return []
+
+def process_file(url, save_dir):
     """
-    下载并解压单个ZIP文件。
-    :param file_info: 包含 file_url 和 file_name 的字典。
-    :param download_dir: 下载和解压文件的目标目录（所有文件将解压到这里）。
-    :param verify_ssl: 是否验证SSL证书。
+    单个文件的处理逻辑：下载 -> 解压 -> 删除压缩包
     """
-    file_url = file_info['url']
-    file_name = file_info['name']
-    file_path = os.path.join(download_dir, file_name)
+    filename = url.split('/')[-1]
+    zip_path = os.path.join(save_dir, filename)
     
-    # 所有的文件最终都将解压到这个目录
-    final_extract_dir = download_dir 
-
-    with print_lock:
-        print(f"\n开始下载: {file_name}")
+    # 获取解压后的预期文件名（假设解压后是 .docx/.doc/.pdf）
+    # 3GPP 的命名规则通常是 R1-xxxxx.zip -> R1-xxxxx.docx
+    # 我们用这一步来做简单的断点续传跳过
+    base_name = os.path.splitext(filename)[0]
+    
+    # 检查是否已经存在同名的 docx/doc/pdf 文件，如果存在则跳过
+    potential_files = [
+        os.path.join(save_dir, base_name + ".docx"),
+        os.path.join(save_dir, base_name + ".doc"),
+        os.path.join(save_dir, base_name + ".pdf")
+    ]
+    
+    for f in potential_files:
+        if os.path.exists(f):
+            # 如果解压后的文件已经存在，直接返回成功，跳过下载
+            return True, "Skipped (Exists)"
 
     try:
-        # 下载文件
-        file_response = requests.get(file_url, stream=True, headers=HEADERS, verify=verify_ssl)
-        file_response.raise_for_status()
-
-        with open(file_path, 'wb') as f:
-            for chunk in file_response.iter_content(chunk_size=8192):
+        # 1. 下载
+        # --- 修改点 2: 增加 verify=False ---
+        response = requests.get(url, stream=True, timeout=60, verify=False)
+        
+        if response.status_code != 200:
+            return False, f"HTTP Error {response.status_code}"
+        
+        with open(zip_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         
-        with print_lock:
-            print(f"下载完成: {file_name}")
-
-        # 解压文件
-        if zipfile.is_zipfile(file_path):
-            # 创建一个临时目录用于解压，以便我们可以处理内部结构
-            temp_extract_dir = os.path.join(download_dir, "temp_zip_extract_" + os.path.splitext(file_name)[0])
-            if not os.path.exists(temp_extract_dir):
-                os.makedirs(temp_extract_dir)
-
-            with print_lock:
-                print(f"开始解压 {file_name} 到临时目录 {temp_extract_dir}")
-            try:
-                with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                    # 首先解压到临时目录
-                    zip_ref.extractall(temp_extract_dir) 
-                
-                # 遍历临时目录中的所有文件和文件夹
-                for root, _, files in os.walk(temp_extract_dir):
-                    for f in files:
-                        source_file_path = os.path.join(root, f)
-                        destination_file_path = os.path.join(final_extract_dir, f) # 直接复制到最终目标目录
-
-                        # 避免覆盖同名文件，可以添加一些处理逻辑，例如重命名
-                        # 对于 3GPP 提案，通常不会有同名文件，但这里可以加一个检查
-                        if os.path.exists(destination_file_path):
-                            with print_lock:
-                                print(f"警告: 目标目录已存在文件 '{f}'，跳过或考虑重命名。")
-                            # 例如，重命名为 'original_name_from_zip_X.ext'
-                            # destination_file_path = os.path.join(final_extract_dir, f"{os.path.splitext(f)[0]}_from_{os.path.splitext(file_name)[0]}{os.path.splitext(f)[1]}")
-                            # shutil.move(source_file_path, destination_file_path)
-                        else:
-                            shutil.move(source_file_path, destination_file_path) # 将文件移动到最终目录
-
-                # 删除临时目录及其内容
-                shutil.rmtree(temp_extract_dir)
-
-                with print_lock:
-                    print(f"解压完成并清理临时文件: {file_name}")
-                
-                # 解压后删除原始ZIP文件
-                os.remove(file_path)
-                with print_lock:
-                    print(f"已删除源文件: {file_name}")
-
-            except zipfile.BadZipFile:
-                with print_lock:
-                    print(f"错误: 文件 {file_name} 不是有效的ZIP文件或已损坏。")
-                # 如果解压失败，也要尝试清理临时目录
-                if os.path.exists(temp_extract_dir):
-                    shutil.rmtree(temp_extract_dir)
-            except Exception as e:
-                with print_lock:
-                    print(f"解压 {file_name} 时发生错误: {e}")
-                # 如果解压失败，也要尝试清理临时目录
-                if os.path.exists(temp_extract_dir):
-                    shutil.rmtree(temp_extract_dir)
-        else:
-            with print_lock:
-                print(f"文件 {file_name} 不是一个有效的ZIP文件，跳过解压。")
-
-    except requests.exceptions.RequestException as e:
-        with print_lock:
-            print(f"下载 {file_name} 时发生错误: {e}")
-    except Exception as e:
-        with print_lock:
-            print(f"处理 {file_name} 时发生未知错误: {e}")
-
-# download_and_extract_zips 函数保持不变
-def download_and_extract_zips(url, download_dir="3GPP_TSGR1_121", max_workers=10, verify_ssl=False):
-    print(f"尝试从 {url} 获取文件列表...")
-
-    try:
-        response = requests.get(url, headers=HEADERS, verify=verify_ssl)
-        response.raise_for_status()  
-    except requests.exceptions.RequestException as e:
-        print(f"访问URL时发生错误: {e}")
-        return
-
-    soup = BeautifulSoup(response.text, 'html.parser')
-    zip_links = [a['href'] for a in soup.find_all('a', href=True) if a['href'].endswith('.zip')]
-
-    if not zip_links:
-        print("未找到任何 .zip 文件链接。")
-        return
-
-    if not os.path.exists(download_dir):
-        os.makedirs(download_dir)
-        print(f"创建目录: {download_dir}")
-
-    print(f"找到 {len(zip_links)} 个ZIP文件。")
-
-    files_to_download = []
-    for link in zip_links:
-        file_url = urljoin(url, link) 
-        file_name = os.path.basename(urlparse(file_url).path)
-        files_to_download.append({'url': file_url, 'name': file_name})
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(download_and_extract_single_zip, file_info, download_dir, verify_ssl) 
-                   for file_info in files_to_download]
+        # 2. 解压
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(save_dir)
+        except zipfile.BadZipFile:
+            os.remove(zip_path)
+            return False, "文件损坏 (Bad Zip)"
+        except Exception as e:
+            # 有些文件可能是非标准zip，忽略错误
+            return False, f"解压失败: {e}"
         
-        for future in concurrent.futures.as_completed(futures):
-            pass
+        # 3. 清理 (删除 zip)
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        
+        return True, "Success"
 
-# 要下载的URL
-target_url = "https://www.3gpp.org/ftp/tsg_ran/WG1_RL1/TSGR1_121/Docs"
+    except Exception as e:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        return False, str(e)
 
-# 根据你之前的调试，这里设置为 False。如果你解决了代理证书问题，可以将其设为 True。
-# 如果你已经配置了CA_BUNDLE_PATH，可以将其值传入这里。
-verify_ssl_setting = False 
+def main():
+    if not os.path.exists(SAVE_DIR):
+        os.makedirs(SAVE_DIR)
+        print(f"创建目录: {SAVE_DIR}")
+
+    # 1. 获取链接列表
+    zip_links = get_zip_links(TARGET_URL)
+    if not zip_links:
+        return
+
+    print(f"开始下载并处理，使用 {MAX_WORKERS} 个线程并发...")
+    print("注意：下载 -> 自动解压 -> 自动删除ZIP")
+
+    # 2. 多线程下载
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_url = {executor.submit(process_file, url, SAVE_DIR): url for url in zip_links}
+        
+        success_count = 0
+        fail_count = 0
+        skipped_count = 0
+        
+        for future in tqdm(as_completed(future_to_url), total=len(zip_links), unit="file"):
+            url = future_to_url[future]
+            try:
+                success, msg = future.result()
+                if success:
+                    if "Skipped" in msg:
+                        skipped_count += 1
+                    else:
+                        success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as e:
+                fail_count += 1
+                tqdm.write(f"异常: {url} -> {e}")
+
+    print("\n" + "="*30)
+    print(f"处理完成！")
+    print(f"成功下载: {success_count}")
+    print(f"跳过已存在: {skipped_count}")
+    print(f"失败: {fail_count}")
+    print(f"文件保存在: {os.path.abspath(SAVE_DIR)}")
+    print("="*30)
 
 if __name__ == "__main__":
-    download_and_extract_zips(target_url, max_workers=8, verify_ssl=verify_ssl_setting)
-    print("\n所有文件处理完毕。")
+    main()
