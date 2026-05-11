@@ -15,11 +15,11 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 这里填你要下载的会议 URL (RAN1, RAN2, RAN4 都可以)
 # 例如 RAN1 #123: https://www.3gpp.org/ftp/tsg_ran/WG1_RL1/TSGR1_123/Docs
-TARGET_URL = "https://www.3gpp.org/ftp/tsg_ran/WG1_RL1/TSGR1_123/Docs"
+TARGET_URL = "https://www.3gpp.org/ftp/tsg_ran/WG1_RL1/TSGR1_125/Docs"
 
 # 本地保存路径 (脚本会自动创建)
 # 建议按会议命名，比如 ./tdocs/RAN1_123
-SAVE_DIR = "E:/000_3GPP_Download/tdocs/RAN1_123"
+SAVE_DIR = "C:\\DeepSpec\\tdocs\\RAN1_125"
 
 # 并发线程数 (建议 5-10，太高可能会被 3GPP 服务器封 IP)
 MAX_WORKERS = 8
