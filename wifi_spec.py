@@ -1,6 +1,8 @@
 import os
 import re
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 import win32com.client
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,19 +13,41 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 YEAR = "2026"
-MONTH = "07"  #"01", "03", "05", "07", "09", "11"
-GROUP = "0wng"  #00be 00bn 0wng 0win
+MONTH = "07"
+GROUP = "00bn"  
 BASE_DIR = f"C:\\DeepSpec\\IEEE_80211_{GROUP}_{YEAR}_{MONTH}"
 
 RAW_DIR = os.path.join(BASE_DIR, "Raw_Documents")
 PDF_DIR = os.path.join(BASE_DIR, "PDF_Classified")
 
 START_URL = f"https://mentor.ieee.org/802.11/documents?is_year={YEAR}&is_month={MONTH}&is_group={GROUP}"
-MAX_WORKERS = 8
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'
-}
+# 【关键降压】：降到 4 线程，防止激怒公司代理服务器
+MAX_WORKERS = 4
+
+# ================= 核心防御引擎 =================
+# 建立全局 Session，恢复使用系统代理，但加入超级容错机制
+session = requests.Session()
+session.verify = False
+session.trust_env = True  # 允许读取系统代理（必需）
+
+# 配置重试策略：如果代理服务器强行掐断连接，自动等待并重试 5 次！
+retry_strategy = Retry(
+    total=5,  
+    backoff_factor=1,  # 重试间隔 1s, 2s, 4s...
+    status_forcelist=[418, 429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+
+# 强制 Connection: close，防止占用代理服务器的长连接导致被踢
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+    'Connection': 'close' 
+})
+# ================================================
 
 def sanitize_filename(filename):
     filename = re.sub(r'[\\/*?:"<>|]', "", filename)
@@ -32,11 +56,11 @@ def sanitize_filename(filename):
 
 def get_latest_tasks():
     print(f"正在分析 IEEE Mentor 页面 (仅抓取当前单页) ...")
-    
     latest_docs_dict = {}
     
     try:
-        response = requests.get(START_URL, headers=HEADERS, timeout=30, verify=False)
+        # 使用配置好的容错 session
+        response = session.get(START_URL, timeout=30)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
@@ -50,14 +74,12 @@ def get_latest_tasks():
                     doc_link = href
                     break
             
-            if not doc_link:
-                continue
+            if not doc_link: continue
 
             download_url = doc_link if doc_link.startswith('http') else "https://mentor.ieee.org" + doc_link
             original_filename = doc_link.split('/')[-1].split('?')[0]
             safe_raw_name = sanitize_filename(original_filename)
             
-            # 从文件名提取 DCN 和 Rev
             parts = original_filename.split('-')
             if len(parts) >= 4 and parts[2].isdigit() and parts[3].isdigit():
                 doc_num = parts[2]
@@ -66,7 +88,6 @@ def get_latest_tasks():
                 doc_num = safe_raw_name.split('.')[0]
                 doc_rev = 0
 
-            # 提取厂商
             cols = row.find_all('td')
             vendor = "Unknown_Vendor"
             if len(cols) >= 6:
@@ -78,11 +99,8 @@ def get_latest_tasks():
                     vendor = sanitize_filename(v_text)
 
             raw_path = os.path.join(RAW_DIR, safe_raw_name)
-            
-            # ==== 修改点：PDF 直接放在总目录下，不在里面建 vendor 子目录 ====
             pdf_filename = f"[{vendor}] {os.path.splitext(safe_raw_name)[0]}.pdf"
             pdf_path = os.path.join(PDF_DIR, pdf_filename)
-            # =========================================================
             
             task_info = {
                 'url': download_url, 'raw': raw_path, 'pdf': pdf_path,
@@ -112,7 +130,8 @@ def process_download(task):
         else: os.remove(raw_path)
 
     try:
-        response = requests.get(url, stream=True, headers=HEADERS, verify=False, timeout=(15, 30))
+        # 同样使用带有重试机制的 session
+        response = session.get(url, stream=True, timeout=(15, 30))
         if response.status_code != 200:
             return False, f"HTTP {response.status_code}", task
             
@@ -129,9 +148,7 @@ def convert_to_pdf_classified(ready_tasks):
     print("开始调用本地 Office 引擎转换为 PDF (平铺模式) ...")
     
     tasks_to_convert = [t for t in ready_tasks if t['raw'].lower().endswith(('.ppt', '.pptx', '.doc', '.docx'))]
-    if not tasks_to_convert:
-        print("没有需要转换的文档。")
-        return
+    if not tasks_to_convert: return
 
     powerpoint = word = None
     try:
@@ -140,7 +157,6 @@ def convert_to_pdf_classified(ready_tasks):
             if not os.path.exists(raw_path) or os.path.getsize(raw_path) < 5120 or os.path.exists(pdf_path):
                 continue
 
-            # 虽然现在没有子文件夹了，但这行留着做双重保险，确保 PDF_DIR 存在
             os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
             input_path_abs, output_path_abs = os.path.abspath(raw_path), os.path.abspath(pdf_path)
 
@@ -156,8 +172,7 @@ def convert_to_pdf_classified(ready_tasks):
                     doc = word.Documents.Open(input_path_abs, Visible=False)
                     doc.SaveAs(output_path_abs, FileFormat=17)
                     doc.Close()
-            except Exception:
-                pass 
+            except Exception: pass 
     finally:
         if powerpoint: powerpoint.Quit()
         if word: word.Quit()
@@ -169,7 +184,7 @@ def main():
     tasks = get_latest_tasks()
     if not tasks: return
 
-    print(f"\n开始使用 {MAX_WORKERS} 个线程并发下载 (防 TCP 假死 + 自动断点续传)...")
+    print(f"\n开始使用 {MAX_WORKERS} 个线程并发下载 (带代理自动重试护甲)...")
     ready_tasks = []
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -178,8 +193,12 @@ def main():
         for future in tqdm(as_completed(future_to_task), total=len(tasks), unit="file", desc="处理文档"):
             try:
                 success, msg, task = future.result()
-                if success: ready_tasks.append(task)
-            except Exception: pass
+                if success: 
+                    ready_tasks.append(task)
+                else:
+                    tqdm.write(f"❌ 失败 [{task['vendor']}_{task['doc_num']}]: {msg}")
+            except Exception as e:
+                tqdm.write(f"❌ 严重异常: {e}")
 
     if ready_tasks:
         convert_to_pdf_classified(ready_tasks)
